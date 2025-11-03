@@ -1,5 +1,6 @@
 // routes/tasks.js
 const express = require('express');
+const mongoose = require('mongoose');
 const Task = require('../models/task');
 const User = require('../models/user');
 
@@ -19,12 +20,18 @@ module.exports = function () {
       throw err;
     }
   }
-  function isCastError(err) {
+  function isBadIdCast(err) {
     return err && err.name === 'CastError' && err.path === '_id';
   }
-  async function ensureUserExists(userId) {
+  async function ensureUserExists(userId, session) {
     if (!userId) return null;
-    const u = await User.findById(userId).select({ name: 1 }).exec();
+    const str = String(userId);
+    if (!mongoose.Types.ObjectId.isValid(str)) {
+      const err = new Error('assignedUser must be a valid ObjectId');
+      err.status = 400;
+      throw err;
+    }
+    const u = await User.findById(str).select({ name: 1 }).session(session || null).exec();
     if (!u) {
       const err = new Error('assignedUser not found');
       err.status = 400;
@@ -34,17 +41,17 @@ module.exports = function () {
   }
 
   // ---------- GET /api/tasks ----------
-  tasksRoute.get(async function (req, res) {
+  tasksRoute.get(async (req, res) => {
     try {
       const where = parseJSON(req.query.where, 'where') || {};
 
-      // Count path: only apply "where"
+      // count-only
       if (req.query.count === 'true') {
         const count = await Task.countDocuments(where);
         return res.status(200).json({ message: 'OK', data: count });
       }
 
-      // List path
+      // list
       let query = Task.find(where);
 
       const sort   = parseJSON(req.query.sort, 'sort');
@@ -52,7 +59,7 @@ module.exports = function () {
 
       if (sort)   query = query.sort(sort);
       if (select) query = query.select(select);
-      else        query = query.select('-__v'); // default: hide __v
+      else        query = query.select('-__v'); // 默认隐藏 __v
 
       if (req.query.skip) {
         const n = parseInt(req.query.skip, 10);
@@ -62,66 +69,75 @@ module.exports = function () {
         const n = parseInt(req.query.limit, 10);
         if (!Number.isNaN(n) && n > 0) query = query.limit(n);
       } else {
-        // tasks default limit = 100 (per spec)
-        query = query.limit(100);
+        query = query.limit(100); // 规范：tasks 默认 100
       }
 
       const tasks = await query.exec();
       return res.status(200).json({ message: 'OK', data: tasks });
     } catch (e) {
       const status = e.status || 500;
-      return res.status(status).json({ message: e.message || 'Error getting tasks', data: {} });
+      const msg = e.status === 400 ? e.message : 'Error getting tasks';
+      return res.status(status).json({ message: msg, data: {} });
     }
   });
 
   // ---------- POST /api/tasks ----------
-  tasksRoute.post(async function (req, res) {
+  tasksRoute.post(async (req, res) => {
+    const session = await Task.startSession();
     try {
-      const body = req.body || {};
-      if (!body.name || !body.deadline) {
-        return res.status(400).json({ message: 'name and deadline are required', data: {} });
-      }
+      let savedTask;
+      await session.withTransaction(async () => {
+        const body = req.body || {};
 
-      // If assignedUser is provided (non-empty), make sure it exists
-      let assignedUserDoc = null;
-      if (body.assignedUser && String(body.assignedUser).trim() !== '') {
-        assignedUserDoc = await ensureUserExists(body.assignedUser);
-      }
+        // parse & validate assigned object (if provided)
+        let assignedUserDoc = null;
+        let assignedUser = '';
+        let assignedUserName = 'unassigned';
+        if (body.assignedUser && String(body.assignedUser).trim() !== '') {
+          assignedUserDoc = await ensureUserExists(body.assignedUser, session);
+          assignedUser = String(assignedUserDoc._id);
+          assignedUserName = assignedUserDoc.name; // force name from database
+        }
 
-      const task = new Task({
-        name: body.name,
-        description: body.description || '',
-        deadline: body.deadline,
-        completed: !!body.completed,
-        assignedUser: assignedUserDoc ? String(assignedUserDoc._id) : '',
-        assignedUserName: assignedUserDoc ? assignedUserDoc.name : (body.assignedUserName || 'unassigned'),
-        dateCreated: new Date()
+        const task = new Task({
+          name: body.name,
+          description: body.description || '',
+          deadline: body.deadline,      // let Schema required validation
+          completed: !!body.completed,
+          assignedUser,
+          assignedUserName,
+          dateCreated: new Date()
+        });
+
+        savedTask = await task.save({ session }); // trigger Schema Validation
+
+        // two-way maintenance: if assigned and not completed → add to assignedUser's pendingTasks
+        if (savedTask.assignedUser && !savedTask.completed) {
+          await User.findByIdAndUpdate(
+            savedTask.assignedUser,
+            { $addToSet: { pendingTasks: savedTask._id } },
+            { session }
+          );
+        }
       });
 
-      const saved = await task.save();
-
-      // Two-way: if assigned & not completed -> add to user's pendingTasks
-      if (saved.assignedUser && !saved.completed) {
-        await User.findByIdAndUpdate(
-          saved.assignedUser,
-          { $addToSet: { pendingTasks: saved._id } }
-        );
-      }
-
-      return res.status(201).json({ message: 'Task created successfully', data: saved });
+      return res.status(201).json({ message: 'Task created successfully', data: savedTask });
     } catch (err) {
       if (err.status === 400) {
         return res.status(400).json({ message: err.message, data: {} });
       }
       if (err.name === 'ValidationError') {
-        return res.status(400).json({ message: 'Validation error', data: err });
+        // unified friendly prompt, do not leak underlying field details
+        return res.status(400).json({ message: 'Invalid task data: name and deadline are required', data: {} });
       }
-      return res.status(500).json({ message: 'Error creating task', data: err });
+      return res.status(500).json({ message: 'Error creating task', data: {} });
+    } finally {
+      session.endSession();
     }
   });
 
   // ---------- GET /api/tasks/:id ----------
-  taskRoute.get(async function (req, res) {
+  taskRoute.get(async (req, res) => {
     try {
       const select = parseJSON(req.query.select, 'select') || { __v: 0 };
       const task = await Task.findById(req.params.id).select(select).exec();
@@ -130,113 +146,104 @@ module.exports = function () {
       }
       return res.status(200).json({ message: 'OK', data: task });
     } catch (err) {
-      if (isCastError(err)) {
+      if (isBadIdCast(err)) {
         return res.status(404).json({ message: 'Task not found', data: {} });
       }
-      const status = err.status || 500;
-      return res.status(status).json({ message: err.message || 'Error getting task', data: {} });
+      return res.status(500).json({ message: 'Error getting task', data: {} });
     }
   });
 
   // ---------- PUT /api/tasks/:id ----------
-  // Replace entire task; name and deadline are required.
-  taskRoute.put(async function (req, res) {
+  // replace entire task; maintain two-way reference consistency with User in transaction
+  taskRoute.put(async (req, res) => {
+    const session = await Task.startSession();
     try {
-      const task = await Task.findById(req.params.id).exec();
-      if (!task) {
-        return res.status(404).json({ message: 'Task not found', data: {} });
-      }
+      let updated;
+      await session.withTransaction(async () => {
+        const task = await Task.findById(req.params.id).session(session);
+        if (!task) { res.status(404).json({ message: 'Task not found', data: {} }); return; }
 
-      const body = req.body || {};
-      if (!body.name || !body.deadline) {
-        return res.status(400).json({ message: 'name and deadline are required for PUT', data: {} });
-      }
+        const body = req.body || {};
 
-      // validate assignedUser if provided (non-empty string)
-      let assignedUserDoc = null;
-      let nextAssignedUser = '';
-      let nextAssignedUserName = 'unassigned';
-      if (body.assignedUser && String(body.assignedUser).trim() !== '') {
-        assignedUserDoc = await ensureUserExists(body.assignedUser);
-        nextAssignedUser = String(assignedUserDoc._id);
-        nextAssignedUserName = assignedUserDoc.name;
-      }
 
-      const prevAssigned  = task.assignedUser ? String(task.assignedUser) : '';
-      const prevCompleted = !!task.completed;
-
-      // Replace fields (reasonable defaults)
-      task.name = body.name;
-      task.description = body.description || '';
-      task.deadline = body.deadline;
-      task.completed = !!body.completed;
-      task.assignedUser = nextAssignedUser;
-      task.assignedUserName = nextAssignedUserName;
-      // keep original dateCreated
-
-      const updated = await task.save();
-
-      // Two-way maintenance:
-      // 1) If previous user differs, pull from old user's pending
-      if (prevAssigned && prevAssigned !== nextAssignedUser) {
-        await User.findByIdAndUpdate(prevAssigned, { $pull: { pendingTasks: updated._id } });
-      }
-
-      // 2) If now has assigned user and not completed -> add to new user's pending
-      if (nextAssignedUser && !updated.completed) {
-        await User.findByIdAndUpdate(nextAssignedUser, { $addToSet: { pendingTasks: updated._id } });
-      }
-
-      // 3) Completion status change on same user
-      if (prevAssigned === nextAssignedUser) {
-        if (!prevCompleted && updated.completed && nextAssignedUser) {
-          // became completed -> remove from pending
-          await User.findByIdAndUpdate(nextAssignedUser, { $pull: { pendingTasks: updated._id } });
-        } else if (prevCompleted && !updated.completed && nextAssignedUser) {
-          // became uncompleted -> add to pending
-          await User.findByIdAndUpdate(nextAssignedUser, { $addToSet: { pendingTasks: updated._id } });
+        let nextAssignedUser = '';
+        let nextAssignedUserName = 'unassigned';
+        if (body.assignedUser && String(body.assignedUser).trim() !== '') {
+          const assignedUserDoc = await ensureUserExists(body.assignedUser, session);
+          nextAssignedUser = String(assignedUserDoc._id);
+          nextAssignedUserName = assignedUserDoc.name;
         }
-      }
+
+        const prevAssigned  = task.assignedUser ? String(task.assignedUser) : '';
+        const prevCompleted = !!task.completed;
+
+        task.name = body.name;
+        task.description = body.description || '';
+        task.deadline = body.deadline;
+        task.completed = !!body.completed;
+        task.assignedUser = nextAssignedUser;
+        task.assignedUserName = nextAssignedUserName;
+
+        updated = await task.save({ session });
+
+        if (prevAssigned && prevAssigned !== nextAssignedUser) {
+          await User.findByIdAndUpdate(prevAssigned, { $pull: { pendingTasks: updated._id } }, { session });
+        }
+        if (nextAssignedUser && !updated.completed) {
+          await User.findByIdAndUpdate(nextAssignedUser, { $addToSet: { pendingTasks: updated._id } }, { session });
+        }
+        if (prevAssigned === nextAssignedUser && nextAssignedUser) {
+          if (!prevCompleted && updated.completed) {
+            await User.findByIdAndUpdate(nextAssignedUser, { $pull: { pendingTasks: updated._id } }, { session });
+          } else if (prevCompleted && !updated.completed) {
+            await User.findByIdAndUpdate(nextAssignedUser, { $addToSet: { pendingTasks: updated._id } }, { session });
+          }
+        }
+      });
 
       return res.status(200).json({ message: 'Task updated successfully', data: updated });
     } catch (err) {
-      if (isCastError(err)) {
+      if (isBadIdCast(err)) {
         return res.status(404).json({ message: 'Task not found', data: {} });
       }
       if (err.status === 400) {
         return res.status(400).json({ message: err.message, data: {} });
       }
       if (err.name === 'ValidationError') {
-        return res.status(400).json({ message: 'Validation error', data: err });
+        return res.status(400).json({ message: 'Invalid task data: name and deadline are required', data: {} });
       }
-      return res.status(500).json({ message: 'Error updating task', data: err });
+      return res.status(500).json({ message: 'Error updating task', data: {} });
+    } finally {
+      session.endSession();
     }
   });
 
   // ---------- DELETE /api/tasks/:id ----------
-  taskRoute.delete(async function (req, res) {
+  taskRoute.delete(async (req, res) => {
+    const session = await Task.startSession();
     try {
-      const task = await Task.findById(req.params.id).exec();
-      if (!task) {
-        return res.status(404).json({ message: 'Task not found', data: {} });
-      }
+      await session.withTransaction(async () => {
+        const task = await Task.findById(req.params.id).session(session);
+        if (!task) { res.status(404).json({ message: 'Task not found', data: {} }); return; }
 
-      const assignedUser = task.assignedUser ? String(task.assignedUser) : '';
+        const assignedUser = task.assignedUser ? String(task.assignedUser) : '';
 
-      await Task.deleteOne({ _id: task._id });
+        await Task.deleteOne({ _id: task._id }, { session });
 
-      // Remove from user's pendingTasks if necessary
-      if (assignedUser && !task.completed) {
-        await User.findByIdAndUpdate(assignedUser, { $pull: { pendingTasks: task._id } });
-      }
+        if (assignedUser && !task.completed) {
+          await User.findByIdAndUpdate(assignedUser, { $pull: { pendingTasks: task._id } }, { session });
+        }
 
-      // Return JSON per assignment's "always message+data"
-      return res.status(200).json({ message: 'Task deleted successfully', data: {} });
+        // 204 No Content
+        res.status(204).send();
+      });
     } catch (err) {
-      if (isCastError(err)) {
+      if (isBadIdCast(err)) {
         return res.status(404).json({ message: 'Task not found', data: {} });
       }
-      return res.status(500).json({ message: 'Error deleting task', data: err });
+      return res.status(500).json({ message: 'Error deleting task', data: {} });
+    } finally {
+      session.endSession();
     }
   });
 
