@@ -19,19 +19,22 @@ module.exports = function () {
       throw err;
     }
   }
+  function isCastError(err) {
+    return err && err.name === 'CastError' && err.path === '_id';
+  }
 
   // ---------- GET /api/users ----------
   usersRoute.get(async function (req, res) {
     try {
       const where = parseJSON(req.query.where, 'where') || {};
 
-      // Count path: only apply "where"
+      // count path
       if (req.query.count === 'true') {
         const count = await User.countDocuments(where);
         return res.status(200).json({ message: 'OK', data: count });
       }
 
-      // List path
+      // list path
       let query = User.find(where);
 
       const sort   = parseJSON(req.query.sort, 'sort');
@@ -39,7 +42,7 @@ module.exports = function () {
 
       if (sort)   query = query.sort(sort);
       if (select) query = query.select(select);
-      else        query = query.select('-__v'); // default: hide __v
+      else        query = query.select('-__v'); // default hide __v
 
       if (req.query.skip) {
         const n = parseInt(req.query.skip, 10);
@@ -48,7 +51,7 @@ module.exports = function () {
       if (req.query.limit) {
         const n = parseInt(req.query.limit, 10);
         if (!Number.isNaN(n) && n > 0) query = query.limit(n);
-      } // users: default unlimited (no implicit limit)
+      } // users: default unlimited
 
       const users = await query.exec();
       return res.status(200).json({ message: 'OK', data: users });
@@ -61,6 +64,10 @@ module.exports = function () {
   // ---------- POST /api/users ----------
   usersRoute.post(async function (req, res) {
     try {
+      if (!req.body?.name || !req.body?.email) {
+        return res.status(400).json({ message: 'name and email are required', data: {} });
+      }
+
       const user = new User(req.body);
       user.dateCreated = new Date();
 
@@ -70,7 +77,6 @@ module.exports = function () {
       if (err.name === 'ValidationError') {
         return res.status(400).json({ message: 'Validation error', data: err });
       }
-      // duplicate email
       if (err.code === 11000) {
         return res.status(409).json({ message: 'User with this email already exists', data: err });
       }
@@ -88,8 +94,10 @@ module.exports = function () {
       }
       return res.status(200).json({ message: 'OK', data: user });
     } catch (err) {
-      const status = err.status || 500;
-      return res.status(status).json({ message: 'Error getting user', data: err });
+      if (isCastError(err)) {
+        return res.status(404).json({ message: 'User not found', data: {} });
+      }
+      return res.status(500).json({ message: 'Error getting user', data: {} });
     }
   });
 
@@ -102,8 +110,7 @@ module.exports = function () {
         return res.status(404).json({ message: 'User not found', data: {} });
       }
 
-      const { name, email, pendingTasks } = req.body;
-
+      const { name, email, pendingTasks } = req.body || {};
       if (!name || !email) {
         return res.status(400).json({
           message: 'name and email are required for PUT',
@@ -119,7 +126,6 @@ module.exports = function () {
       user.name = name;
       user.email = email;
       user.pendingTasks = Array.from(newPending);
-      // Keep original dateCreated
 
       const updated = await user.save();
 
@@ -134,7 +140,7 @@ module.exports = function () {
       }
 
       // 2) Tasks added to user's pending → assign to this user
-      const added = [...newPending].filter(id => oldPending.has(id) === false);
+      const added = [...newPending].filter(id => !oldPending.has(id));
       if (added.length) {
         await Task.updateMany(
           { _id: { $in: added } },
@@ -144,6 +150,9 @@ module.exports = function () {
 
       return res.status(200).json({ message: 'User updated successfully', data: updated });
     } catch (err) {
+      if (isCastError(err)) {
+        return res.status(404).json({ message: 'User not found', data: {} });
+      }
       if (err.code === 11000) {
         return res.status(409).json({ message: 'User with this email already exists', data: err });
       }
@@ -170,8 +179,12 @@ module.exports = function () {
 
       await User.deleteOne({ _id: user._id });
 
+      // Return JSON per assignment's "always message+data"
       return res.status(200).json({ message: 'User deleted successfully', data: {} });
     } catch (err) {
+      if (isCastError(err)) {
+        return res.status(404).json({ message: 'User not found', data: {} });
+      }
       return res.status(500).json({ message: 'Error deleting user', data: err });
     }
   });

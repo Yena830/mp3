@@ -5,20 +5,32 @@ const User = require('../models/user');
 
 module.exports = function () {
   const router = express.Router();
-
   const tasksRoute = router.route('/');
-  const taskRoute = router.route('/:id');
+  const taskRoute  = router.route('/:id');
 
   // ---------- helpers ----------
-  function parseJSON(q, field) {
+  function parseJSON(q, fieldName) {
     if (!q) return null;
     try {
       return JSON.parse(q);
     } catch {
-      const err = new Error(`Invalid JSON in "${field}"`);
+      const err = new Error(`Invalid JSON in "${fieldName}"`);
       err.status = 400;
       throw err;
     }
+  }
+  function isCastError(err) {
+    return err && err.name === 'CastError' && err.path === '_id';
+  }
+  async function ensureUserExists(userId) {
+    if (!userId) return null;
+    const u = await User.findById(userId).select({ name: 1 }).exec();
+    if (!u) {
+      const err = new Error('assignedUser not found');
+      err.status = 400;
+      throw err;
+    }
+    return u;
   }
 
   // ---------- GET /api/tasks ----------
@@ -26,24 +38,33 @@ module.exports = function () {
     try {
       const where = parseJSON(req.query.where, 'where') || {};
 
-      // If asking for count, only apply "where" conditions.
+      // Count path: only apply "where"
       if (req.query.count === 'true') {
         const count = await Task.countDocuments(where);
         return res.status(200).json({ message: 'OK', data: count });
       }
 
+      // List path
       let query = Task.find(where);
 
-      const sort = parseJSON(req.query.sort, 'sort');
-      if (sort) query = query.sort(sort);
-
+      const sort   = parseJSON(req.query.sort, 'sort');
       const select = parseJSON(req.query.select, 'select');
-      if (select) query = query.select(select);
-      else query = query.select('-__v'); // default: hide __v
 
-      if (req.query.skip) query = query.skip(parseInt(req.query.skip, 10));
-      if (req.query.limit) query = query.limit(parseInt(req.query.limit, 10));
-      else query = query.limit(100); // default limit for tasks
+      if (sort)   query = query.sort(sort);
+      if (select) query = query.select(select);
+      else        query = query.select('-__v'); // default: hide __v
+
+      if (req.query.skip) {
+        const n = parseInt(req.query.skip, 10);
+        if (!Number.isNaN(n)) query = query.skip(n);
+      }
+      if (req.query.limit) {
+        const n = parseInt(req.query.limit, 10);
+        if (!Number.isNaN(n) && n > 0) query = query.limit(n);
+      } else {
+        // tasks default limit = 100 (per spec)
+        query = query.limit(100);
+      }
 
       const tasks = await query.exec();
       return res.status(200).json({ message: 'OK', data: tasks });
@@ -56,22 +77,42 @@ module.exports = function () {
   // ---------- POST /api/tasks ----------
   tasksRoute.post(async function (req, res) {
     try {
-      const task = new Task(req.body);
-      task.dateCreated = new Date();
+      const body = req.body || {};
+      if (!body.name || !body.deadline) {
+        return res.status(400).json({ message: 'name and deadline are required', data: {} });
+      }
 
-      const savedTask = await task.save();
+      // If assignedUser is provided (non-empty), make sure it exists
+      let assignedUserDoc = null;
+      if (body.assignedUser && String(body.assignedUser).trim() !== '') {
+        assignedUserDoc = await ensureUserExists(body.assignedUser);
+      }
 
-      // Two-way reference: when a task is assigned and not completed, add to user's pendingTasks
-      if (savedTask.assignedUser && !savedTask.completed) {
+      const task = new Task({
+        name: body.name,
+        description: body.description || '',
+        deadline: body.deadline,
+        completed: !!body.completed,
+        assignedUser: assignedUserDoc ? String(assignedUserDoc._id) : '',
+        assignedUserName: assignedUserDoc ? assignedUserDoc.name : (body.assignedUserName || 'unassigned'),
+        dateCreated: new Date()
+      });
+
+      const saved = await task.save();
+
+      // Two-way: if assigned & not completed -> add to user's pendingTasks
+      if (saved.assignedUser && !saved.completed) {
         await User.findByIdAndUpdate(
-          savedTask.assignedUser,
-          { $addToSet: { pendingTasks: savedTask._id } },
-          { new: false }
+          saved.assignedUser,
+          { $addToSet: { pendingTasks: saved._id } }
         );
       }
 
-      return res.status(201).json({ message: 'Task created successfully', data: savedTask });
+      return res.status(201).json({ message: 'Task created successfully', data: saved });
     } catch (err) {
+      if (err.status === 400) {
+        return res.status(400).json({ message: err.message, data: {} });
+      }
       if (err.name === 'ValidationError') {
         return res.status(400).json({ message: 'Validation error', data: err });
       }
@@ -82,29 +123,23 @@ module.exports = function () {
   // ---------- GET /api/tasks/:id ----------
   taskRoute.get(async function (req, res) {
     try {
-      const task = await Task.findById(req.params.id).exec();
+      const select = parseJSON(req.query.select, 'select') || { __v: 0 };
+      const task = await Task.findById(req.params.id).select(select).exec();
       if (!task) {
         return res.status(404).json({ message: 'Task not found', data: {} });
       }
-
-      // Support ?select=... for the :id endpoint
-      const select = parseJSON(req.query.select, 'select');
-      if (select) {
-        Object.keys(select).forEach((k) => {
-          if (select[k] === 0) task[k] = undefined;
-        });
-        if (select.__v !== 1) task.__v = undefined;
-      } else {
-        task.__v = undefined;
-      }
-
       return res.status(200).json({ message: 'OK', data: task });
     } catch (err) {
-      return res.status(500).json({ message: 'Error getting task', data: err });
+      if (isCastError(err)) {
+        return res.status(404).json({ message: 'Task not found', data: {} });
+      }
+      const status = err.status || 500;
+      return res.status(status).json({ message: err.message || 'Error getting task', data: {} });
     }
   });
 
   // ---------- PUT /api/tasks/:id ----------
+  // Replace entire task; name and deadline are required.
   taskRoute.put(async function (req, res) {
     try {
       const task = await Task.findById(req.params.id).exec();
@@ -112,43 +147,65 @@ module.exports = function () {
         return res.status(404).json({ message: 'Task not found', data: {} });
       }
 
-      // Snapshots for two-way updates
-      const oldAssignedUser = task.assignedUser ? String(task.assignedUser) : '';
-      const wasCompleted = !!task.completed;
-
-      // Apply updates
-      task.name = req.body.name ?? task.name;
-      task.description = req.body.description ?? task.description;
-      task.deadline = req.body.deadline ?? task.deadline;
-      task.completed = (req.body.completed !== undefined) ? req.body.completed : task.completed;
-      task.assignedUser = req.body.assignedUser ?? task.assignedUser;
-      task.assignedUserName = req.body.assignedUserName ?? task.assignedUserName;
-
-      const updatedTask = await task.save();
-
-      // Two-way maintenance
-      const newAssignedUser = updatedTask.assignedUser ? String(updatedTask.assignedUser) : '';
-      const isCompleted = !!updatedTask.completed;
-
-      // If user changed: pull from old, add to new (only if not completed)
-      if (oldAssignedUser && oldAssignedUser !== newAssignedUser) {
-        await User.findByIdAndUpdate(oldAssignedUser, { $pull: { pendingTasks: updatedTask._id } });
-      }
-      if (newAssignedUser && !isCompleted) {
-        await User.findByIdAndUpdate(newAssignedUser, { $addToSet: { pendingTasks: updatedTask._id } });
+      const body = req.body || {};
+      if (!body.name || !body.deadline) {
+        return res.status(400).json({ message: 'name and deadline are required for PUT', data: {} });
       }
 
-      // If completion status toggled: sync pendingTasks for the (new/current) user
-      if (wasCompleted !== isCompleted && newAssignedUser) {
-        if (isCompleted) {
-          await User.findByIdAndUpdate(newAssignedUser, { $pull: { pendingTasks: updatedTask._id } });
-        } else {
-          await User.findByIdAndUpdate(newAssignedUser, { $addToSet: { pendingTasks: updatedTask._id } });
+      // validate assignedUser if provided (non-empty string)
+      let assignedUserDoc = null;
+      let nextAssignedUser = '';
+      let nextAssignedUserName = 'unassigned';
+      if (body.assignedUser && String(body.assignedUser).trim() !== '') {
+        assignedUserDoc = await ensureUserExists(body.assignedUser);
+        nextAssignedUser = String(assignedUserDoc._id);
+        nextAssignedUserName = assignedUserDoc.name;
+      }
+
+      const prevAssigned  = task.assignedUser ? String(task.assignedUser) : '';
+      const prevCompleted = !!task.completed;
+
+      // Replace fields (reasonable defaults)
+      task.name = body.name;
+      task.description = body.description || '';
+      task.deadline = body.deadline;
+      task.completed = !!body.completed;
+      task.assignedUser = nextAssignedUser;
+      task.assignedUserName = nextAssignedUserName;
+      // keep original dateCreated
+
+      const updated = await task.save();
+
+      // Two-way maintenance:
+      // 1) If previous user differs, pull from old user's pending
+      if (prevAssigned && prevAssigned !== nextAssignedUser) {
+        await User.findByIdAndUpdate(prevAssigned, { $pull: { pendingTasks: updated._id } });
+      }
+
+      // 2) If now has assigned user and not completed -> add to new user's pending
+      if (nextAssignedUser && !updated.completed) {
+        await User.findByIdAndUpdate(nextAssignedUser, { $addToSet: { pendingTasks: updated._id } });
+      }
+
+      // 3) Completion status change on same user
+      if (prevAssigned === nextAssignedUser) {
+        if (!prevCompleted && updated.completed && nextAssignedUser) {
+          // became completed -> remove from pending
+          await User.findByIdAndUpdate(nextAssignedUser, { $pull: { pendingTasks: updated._id } });
+        } else if (prevCompleted && !updated.completed && nextAssignedUser) {
+          // became uncompleted -> add to pending
+          await User.findByIdAndUpdate(nextAssignedUser, { $addToSet: { pendingTasks: updated._id } });
         }
       }
 
-      return res.status(200).json({ message: 'Task updated successfully', data: updatedTask });
+      return res.status(200).json({ message: 'Task updated successfully', data: updated });
     } catch (err) {
+      if (isCastError(err)) {
+        return res.status(404).json({ message: 'Task not found', data: {} });
+      }
+      if (err.status === 400) {
+        return res.status(400).json({ message: err.message, data: {} });
+      }
       if (err.name === 'ValidationError') {
         return res.status(400).json({ message: 'Validation error', data: err });
       }
@@ -168,12 +225,17 @@ module.exports = function () {
 
       await Task.deleteOne({ _id: task._id });
 
-      if (assignedUser) {
+      // Remove from user's pendingTasks if necessary
+      if (assignedUser && !task.completed) {
         await User.findByIdAndUpdate(assignedUser, { $pull: { pendingTasks: task._id } });
       }
 
+      // Return JSON per assignment's "always message+data"
       return res.status(200).json({ message: 'Task deleted successfully', data: {} });
     } catch (err) {
+      if (isCastError(err)) {
+        return res.status(404).json({ message: 'Task not found', data: {} });
+      }
       return res.status(500).json({ message: 'Error deleting task', data: err });
     }
   });
